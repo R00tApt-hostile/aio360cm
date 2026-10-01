@@ -292,3 +292,42 @@ def unlock_stfs(path: str, output_path: Optional[str] = None) -> bool:
         return True
     except Exception:
         return False
+# ---------------------------------------------------------------------------
+# v2 additions: backup + restore + convenience
+# ---------------------------------------------------------------------------
+
+BACKUP_SUFFIX = ".x360cm.bak"
+
+
+def backup_file(path: str) -> Optional[str]:
+    """Create a sidecar backup. Returns the backup path or None on failure."""
+    import shutil
+    backup = path + BACKUP_SUFFIX
+    if os.path.exists(backup):
+        return backup
+    try:
+        shutil.copy2(path, backup)
+        return backup
+    except Exception:
+        return None
+
+
+def restore_backup(path: str) -> bool:
+    """Restore a file from its .x360cm.bak sidecar, if present."""
+    import shutil
+    backup = path + BACKUP_SUFFIX
+    if not os.path.exists(backup):
+        return False
+    try:
+        shutil.copy2(backup, path)
+        return True
+    except Exception:
+        return False
+
+
+def unlock_stfs_safe(path: str, output_path: Optional[str] = None,
+                     make_backup: bool = True) -> bool:
+    """Unlock with automatic backup. Wraps unlock_stfs()."""
+    if make_backup and (output_path is None or output_path == path):
+        backup_file(path)
+    return unlock_stfs(path, output_path)
