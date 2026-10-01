@@ -172,3 +172,144 @@ def build_remote_path(header, kind: str) -> str:
 
     # Fallback: use the content-type value as the folder name
     return f"{base}/{title}/{ct:08X}"
+
+# ---------------------------------------------------------------------------
+# v2 additions: parallel uploads, verification, retry
+# ---------------------------------------------------------------------------
+
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def _retry(callable_, attempts: int = 3, base_delay: float = 0.5):
+    """Retry a callable with exponential backoff. Returns (ok, result_or_err)."""
+    last_err = None
+    for i in range(attempts):
+        try:
+            return True, callable_()
+        except Exception as e:
+            last_err = e
+            time.sleep(base_delay * (2 ** i))
+    return False, last_err
+
+
+def remote_size(client: XboxFTPClient, remote_path: str) -> Optional[int]:
+    """Get the size of a remote file via SIZE. Returns None on failure."""
+    if not client.ftp:
+        return None
+    try:
+        client.ftp.voidcmd("TYPE I")
+        return client.ftp.size(remote_path)
+    except Exception:
+        return None
+
+
+def upload_file_verified(client: XboxFTPClient, local_path: str,
+                         remote_path: str,
+                         progress: Optional[Callable[[int, int], None]] = None,
+                         verify: bool = True,
+                         attempts: int = 3) -> bool:
+    """Upload a file with retry and optional size verification."""
+    local_size = os.path.getsize(local_path)
+
+    def do_upload():
+        ok = client.upload_file(local_path, remote_path, progress=progress)
+        if not ok:
+            raise RuntimeError("upload_file returned False")
+        if verify:
+            rsize = remote_size(client, remote_path)
+            if rsize != local_size:
+                raise RuntimeError(
+                    f"size mismatch: local={local_size} remote={rsize}")
+        return True
+
+    ok, err = _retry(do_upload, attempts=attempts)
+    if not ok:
+        print(f"[ftp] upload failed after retries: {remote_path} ({err})")
+    return ok
+
+
+def upload_many_parallel(files: list,
+                         host: str, port: int = 21,
+                         user: str = "xboxftp",
+                         password: str = "xboxftp",
+                         workers: int = 4,
+                         verify: bool = True,
+                         progress: Optional[Callable] = None
+                         ) -> tuple:
+    """Upload multiple (local_path, remote_path) tuples in parallel.
+
+    Each worker uses its own FTP connection. `progress` is called as
+        progress(local_path, remote_path, sent_bytes, total_bytes)
+    on every chunk. Returns (success_count, failure_count, errors_list).
+    """
+    files = list(files)
+    if not files:
+        return 0, 0, []
+
+    total_size = sum(os.path.getsize(l) for l, _ in files if os.path.exists(l))
+    sent_total = [0]
+    lock = __import__("threading").Lock()
+
+    def make_cb(local_path):
+        def cb(sent, total):
+            with lock:
+                sent_total[0] = sent_total[0] + 0  # noop, kept for clarity
+            if progress:
+                progress(local_path, "", sent, total)
+        return cb
+
+    def worker(item):
+        local, remote = item
+        client = XboxFTPClient()
+        if not client.connect(host, port, user, password):
+            return (local, remote, False, "connect failed")
+        try:
+            ok = upload_file_verified(
+                client, local, remote,
+                progress=make_cb(local),
+                verify=verify,
+            )
+            return (local, remote, ok, None if ok else "upload failed")
+        finally:
+            client.disconnect()
+
+    successes = 0
+    failures = 0
+    errors = []
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futures = {ex.submit(worker, f): f for f in files}
+        for fut in as_completed(futures):
+            local, remote, ok, err = fut.result()
+            if ok:
+                successes += 1
+            else:
+                failures += 1
+                errors.append((local, remote, err))
+
+    return successes, failures, errors
+
+
+def prepare_upload_plan(items, verify_headers: bool = True) -> list:
+    """Convert scan items into (local_path, remote_path) tuples for upload.
+
+    For GOD folders, expands into individual file entries.
+    """
+    from svod import get_data_fragments, find_god_header
+
+    plan = []
+    for kind, path, header in items:
+        remote_dir = build_remote_path(header, kind)
+        if kind == "god":
+            header_path = find_god_header(path)
+            fragments = get_data_fragments(path)
+            for f in ([header_path] if header_path else []) + fragments:
+                if not f:
+                    continue
+                remote_file = f"{remote_dir}/{os.path.basename(f)}"
+                plan.append((f, remote_file))
+        else:
+            remote_file = f"{remote_dir}/{os.path.basename(path)}"
+            plan.append((path, remote_file))
+    return plan
